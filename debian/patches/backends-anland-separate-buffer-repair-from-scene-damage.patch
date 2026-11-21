@@ -1,0 +1,321 @@
+Description: Keep Anland buffer repair separate from scene damage
+
+diff --git a/src/backends/anland/anland_backend.cpp b/src/backends/anland/anland_backend.cpp
+index 6e15e9b..33f457e 100644
+--- a/src/backends/anland/anland_backend.cpp
++++ b/src/backends/anland/anland_backend.cpp
+@@ -228,12 +228,12 @@ void AnlandBackend::setEglDisplay(std::unique_ptr<EglDisplay> &&display)
+
+ bool AnlandBackend::notifyFramePresented()
+ {
+-    if (m_consumerReady) {
+-        trigger_refresh(m_display);
+-        m_consumerReady = false;
+-        return true;
++    if (m_selectedBuffer < 0) {
++        return false;
+     }
+-    return false;
++    m_selectedBuffer = -1;
++    trigger_refresh(m_display);
++    return true;
+ }
+
+ void AnlandBackend::setupNotifiers()
+@@ -408,20 +408,13 @@ void AnlandBackend::onBufferReady()
+         return;
+     }
+
+-    // The dmabuf set is already in hand (try_exit_fallback() received it when we
+-    // left fallback), so buffer-ready is purely a frame-completion signal: drain
+-    // the eventfd and pace the render cycle.
+-    const int fd = get_buffer_ready_fd(m_display);
+-    if (fd >= 0) {
+-        eventfd_t val;
+-        eventfd_read(fd, &val);
++    eventfd_t count;
++    if (eventfd_read(get_buffer_ready_fd(m_display), &count) != 0) {
++        return;
+     }
+
+-    m_consumerReady = true;
+-
+-    // Buffer-ready is our frame-completion signal: complete the in-flight frame
+-    // (if any) and schedule the next one, keeping the render cycle paced by the
+-    // consumer rather than a timer.
++    // Keep the slot offered by this notification until we hand the frame back.
++    m_selectedBuffer = get_selected_idx(m_display);
+     m_outputs[0]->onConsumerReady();
+ }
+
+@@ -454,7 +447,7 @@ void AnlandBackend::enterFallback()
+         layer->releaseBuffers();
+     }
+
+-    m_consumerReady = false;
++    m_selectedBuffer = -1;
+     m_inFallback = true;
+
+     // The consumer's camera fds are now dead: stop recording, destroy the virtual
+@@ -479,16 +472,9 @@ void AnlandBackend::onReconnectTimer()
+
+     qCInfo(KWIN_ANLAND) << "consumer reconnected";
+     m_inFallback = false;
+-    m_consumerReady = false;
+     m_reconnectTimer->stop();
+
+-    // try_exit_fallback() already received a fresh dmabuf set. Import it into the
+-    // layer (which arms an infinite/full-output repaint on every rotation buffer),
+-    // resume the RenderLoop (uninhibit, balancing the inhibit from onConsumerLost),
+-    // and mark the layer dirty. addRepaint() marks the full output dirty so the next
+-    // composite() paints into the new dmabufs even on an idle desktop.
+-    // resumeRendering() runs unconditionally to keep inhibit/uninhibit
+-    // balanced regardless of whether the GL layer is attached yet.
++    // Import the fresh buffers now. The render loop resumes on buffer-ready.
+     AnlandEglLayer *layer = m_outputs[0]->eglLayer();
+     if (layer) {
+         const int bufferCount = get_buf_count(m_display);
+@@ -505,22 +491,12 @@ void AnlandBackend::onReconnectTimer()
+     qCDebug(KWIN_ANLAND) << "reconnect: attaching audio fd" << get_audio_fd(m_display);
+     anland_audio_set_fd(get_audio_fd(m_display));
+     qCDebug(KWIN_ANLAND) << "reconnect: audio fd attached";
+-    // Render loop is resuming and the data channel is live: immediately request the
+-    // camera service. The consumer replies asynchronously with an INPUT_TYPE_RESOURCE
++    // The data channel is live. The consumer replies asynchronously with an INPUT_TYPE_RESOURCE
+     // event whose fds onInputReadable() hands to the camera engine. If the consumer
+     // has the camera disabled it simply never registers the service and never replies,
+     // so this is a harmless no-op in that case.
+     const int cameraRequestResult = push_resources_request(m_display, SERVICE_TYPE_CAMERA, nullptr);
+     qCDebug(KWIN_ANLAND) << "reconnect: camera request result" << cameraRequestResult;
+-    if (m_inFallback) {
+-        return;
+-    }
+-    m_outputs[0]->resumeRendering();
+-    qCDebug(KWIN_ANLAND) << "reconnect: render loop resumed";
+-    if (layer) {
+-        layer->addRepaint(infiniteRegion());
+-        qCDebug(KWIN_ANLAND) << "reconnect: repaint scheduled";
+-    }
+ }
+
+ // ---------------------------------------------------------------------------
+diff --git a/src/backends/anland/anland_backend.h b/src/backends/anland/anland_backend.h
+index 523ab82..5983e6c 100644
+--- a/src/backends/anland/anland_backend.h
++++ b/src/backends/anland/anland_backend.h
+@@ -71,6 +71,10 @@ public:
+         return m_inputDevice.get();
+     }
+
++    int selectedBuffer() const
++    {
++        return m_selectedBuffer;
++    }
+     bool notifyFramePresented();
+
+     /** Re-run the Workspace output layout after an output changed its mode at
+@@ -117,7 +121,7 @@ private:
+     QSocketNotifier *m_bufReadyNotifier = nullptr;
+     QTimer *m_reconnectTimer = nullptr;
+
+-    bool m_consumerReady = false;
++    int m_selectedBuffer = -1;
+     bool m_inFallback = false;
+     bool m_noDrmDeviceMode = false;
+
+diff --git a/src/backends/anland/anland_egl_backend.cpp b/src/backends/anland/anland_egl_backend.cpp
+index 9ecab43..250922e 100644
+--- a/src/backends/anland/anland_egl_backend.cpp
++++ b/src/backends/anland/anland_egl_backend.cpp
+@@ -12,6 +12,7 @@
+ // kwin
+ #include "core/graphicsbuffer.h" // DmaBufAttributes
+ #include "core/output.h" // OutputTransform
++#include "core/renderloop.h"
+ #include "opengl/egldisplay.h"
+ #include "opengl/eglcontext.h"
+ #include "opengl/eglnativefence.h"
+@@ -80,8 +81,6 @@ void AnlandEglLayer::releaseBuffers()
+         m_renderTargets[i].reset();
+         m_accumDamage[i] = QRegion();
+     }
+-    m_damageFlags = 0;
+-    m_damageMask = 0;
+     m_bufCount = 0;
+     m_traceNextFrame = false;
+ }
+@@ -175,8 +174,6 @@ bool AnlandEglLayer::importBuffers(int count)
+     }
+
+     m_bufCount = count;
+-    m_damageMask = (uint8_t)((1 << m_bufCount) - 1);
+-    m_damageFlags = m_damageMask;
+     m_traceNextFrame = true;
+     return true;
+ }
+@@ -191,30 +188,35 @@ void AnlandEglLayer::onOutputTransformChanged()
+         m_renderTargets[i].emplace(m_fbos[i].get());
+         m_accumDamage[i] = infiniteRegion();
+     }
+-    m_damageFlags = m_damageMask;
+-    addRepaint(infiniteRegion());
++    m_output->renderLoop()->scheduleRepaint();
++}
++
++bool AnlandEglLayer::needsRepaint() const
++{
++    const int index = m_backend->selectedBuffer();
++    // Buffer repair is returned by beginFrame(), separate from scene damage.
++    return OutputLayer::needsRepaint()
++        || (index >= 0 && index < m_bufCount && !m_accumDamage[index].isEmpty());
+ }
+
+ std::optional<OutputLayerBeginFrameInfo> AnlandEglLayer::doBeginFrame()
+ {
+     m_backend->openglContext()->makeCurrent();
+
+-    m_currentIndex = get_selected_idx(m_display);
+-
+-    if (m_bufCount <= 0 || m_currentIndex < 0 || m_currentIndex >= m_bufCount
+-        || !m_renderTargets[m_currentIndex]) {
++    const int index = m_backend->selectedBuffer();
++    if (index < 0 || index >= m_bufCount) {
+         qCWarning(KWIN_ANLAND) << "cannot begin frame with buffer count" << m_bufCount
+-                               << "and selected index" << m_currentIndex;
++                               << "and selected index" << index;
+         return std::nullopt;
+     }
+     if (m_traceNextFrame) {
+         qCDebug(KWIN_ANLAND) << "beginning first frame after buffer import with index"
+-                             << m_currentIndex << "of" << m_bufCount;
++                             << index << "of" << m_bufCount;
+     }
+
+     return OutputLayerBeginFrameInfo{
+-        .renderTarget = *m_renderTargets[m_currentIndex],
+-        .repaint = m_accumDamage[m_currentIndex],
++        .renderTarget = *m_renderTargets[index],
++        .repaint = m_accumDamage[index],
+     };
+ }
+
+@@ -224,14 +226,8 @@ bool AnlandEglLayer::doEndFrame(const QRegion &renderedDeviceRegion, const QRegi
+     for (int i = 0; i < m_bufCount; i++)
+         m_accumDamage[i] = m_accumDamage[i] + damagedDeviceRegion;
+
+-    if (!damagedDeviceRegion.isEmpty())
+-        m_damageFlags = m_damageMask;
+-
+-    m_accumDamage[m_currentIndex] = QRegion();
+-
+-    m_damageFlags &= ~(uint8_t)(1 << m_currentIndex);
+-    if (m_damageFlags != 0)
+-        addRepaint(infiniteRegion());
++    const int index = m_backend->selectedBuffer();
++    m_accumDamage[index] = QRegion();
+
+     // Instead of CPU-blocking on glFinish, create a fence for the just-submitted
+     // GPU work and hand it to the consumer (via the transport). The consumer passes
+@@ -243,7 +239,7 @@ bool AnlandEglLayer::doEndFrame(const QRegion &renderedDeviceRegion, const QRegi
+     set_render_fence(m_display, fenceFd);
+     if (m_traceNextFrame) {
+         qCDebug(KWIN_ANLAND) << "finished first frame after buffer import with index"
+-                             << m_currentIndex << "native fence valid" << fenceValid
++                             << index << "native fence valid" << fenceValid
+                              << "fd" << fenceFd;
+         m_traceNextFrame = false;
+     }
+diff --git a/src/backends/anland/anland_egl_backend.h b/src/backends/anland/anland_egl_backend.h
+index 1252a76..0903459 100644
+--- a/src/backends/anland/anland_egl_backend.h
++++ b/src/backends/anland/anland_egl_backend.h
+@@ -43,6 +43,7 @@ public:
+     AnlandEglLayer(AnlandOutput *output, AnlandEglBackend *backend);
+     ~AnlandEglLayer() override;
+
++    bool needsRepaint() const override;
+     std::optional<OutputLayerBeginFrameInfo> doBeginFrame() override;
+     bool doEndFrame(const QRegion &renderedDeviceRegion, const QRegion &damagedDeviceRegion, OutputFrame *frame) override;
+     DrmDevice *scanoutDevice() const override;
+@@ -58,9 +59,6 @@ private:
+     display_ctx *const m_display;
+
+     int m_bufCount = 0;
+-    int m_currentIndex = 0;
+-    uint8_t m_damageFlags = 0;
+-    uint8_t m_damageMask = 0;
+     bool m_traceNextFrame = false;
+     std::array<std::shared_ptr<GLTexture>, MAX_BUFS> m_textures;
+     std::array<std::unique_ptr<GLFramebuffer>, MAX_BUFS> m_fbos;
+diff --git a/src/backends/anland/anland_output.cpp b/src/backends/anland/anland_output.cpp
+index d73b2f5..54898cf 100644
+--- a/src/backends/anland/anland_output.cpp
++++ b/src/backends/anland/anland_output.cpp
+@@ -114,8 +114,10 @@ void AnlandOutput::onConsumerReady()
+         m_awaitingPresent = false;
+         completeFrame();
+     }
+-    // Render the next frame in lockstep with the consumer, exactly as the 5.27
+-    // backend did: the consumer's buffer-ready drives scheduleRepaint().
++    if (m_renderingInhibited) {
++        m_renderLoop->uninhibit();
++        m_renderingInhibited = false;
++    }
+     m_renderLoop->scheduleRepaint();
+ }
+
+@@ -173,14 +175,6 @@ void AnlandOutput::stopRendering()
+     }
+ }
+
+-void AnlandOutput::resumeRendering()
+-{
+-    if (m_renderingInhibited) {
+-        m_renderLoop->uninhibit();
+-        m_renderingInhibited = false;
+-    }
+-}
+-
+ } // namespace KWin
+
+ #include "moc_anland_output.cpp"
+diff --git a/src/backends/anland/anland_output.h b/src/backends/anland/anland_output.h
+index cfed72b..2a6cf6f 100644
+--- a/src/backends/anland/anland_output.h
++++ b/src/backends/anland/anland_output.h
+@@ -63,13 +63,9 @@ public:
+      *  longer exist. */
+     void stopRendering();
+
+-    /** Consumer reconnected: uninhibit() the RenderLoop so compositing resumes. */
+-    void resumeRendering();
+-
+     /** The primary render layer for this output. Owned by AnlandEglBackend and
+      *  wired up in AnlandEglBackend::addOutput(); null while no render backend is
+-     *  attached. Lets AnlandBackend drive the layer through its output — e.g.
+-     *  schedule a repaint when leaving fallback. */
++     *  attached. Lets AnlandBackend import and release the consumer's buffers. */
+     void setEglLayer(AnlandEglLayer *layer);
+     AnlandEglLayer *eglLayer() const;
+
+@@ -84,7 +80,6 @@ private:
+     AnlandEglLayer *m_eglLayer = nullptr;
+     bool m_awaitingPresent = false;
+     // Tracks our RenderLoop::inhibit() so inhibit/uninhibit stay balanced
+-    // (uninhibit() asserts the count is > 0). See onConsumerLost()/resumeRendering().
+     bool m_renderingInhibited = false;
+ };
+
+diff --git a/src/core/outputlayer.h b/src/core/outputlayer.h
+index 055560b..959f562 100644
+--- a/src/core/outputlayer.h
++++ b/src/core/outputlayer.h
+@@ -50,7 +50,7 @@ public:
+     QRegion repaints() const;
+     void resetRepaints();
+     void addRepaint(const QRegion &region);
+-    bool needsRepaint() const;
++    virtual bool needsRepaint() const;
+
+     /**
+      * Enables or disables this layer. Note that disabling the primary layer will cause problems
