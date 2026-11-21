@@ -124,7 +124,7 @@ index 523ab82..5983e6c 100644
      bool m_noDrmDeviceMode = false;
 
 diff --git a/src/backends/anland/anland_egl_backend.cpp b/src/backends/anland/anland_egl_backend.cpp
-index 9ecab43..250922e 100644
+index 9ecab43..6fb300f 100644
 --- a/src/backends/anland/anland_egl_backend.cpp
 +++ b/src/backends/anland/anland_egl_backend.cpp
 @@ -12,6 +12,7 @@
@@ -164,7 +164,7 @@ index 9ecab43..250922e 100644
 +
 +bool AnlandEglLayer::needsRepaint() const
 +{
-+    const int index = m_backend->selectedBuffer();
++    const int index = m_backend->backend()->selectedBuffer();
 +    // Buffer repair is returned by beginFrame(), separate from scene damage.
 +    return OutputLayer::needsRepaint()
 +        || (index >= 0 && index < m_bufCount && !m_accumDamage[index].isEmpty());
@@ -178,7 +178,7 @@ index 9ecab43..250922e 100644
 -
 -    if (m_bufCount <= 0 || m_currentIndex < 0 || m_currentIndex >= m_bufCount
 -        || !m_renderTargets[m_currentIndex]) {
-+    const int index = m_backend->selectedBuffer();
++    const int index = m_backend->backend()->selectedBuffer();
 +    if (index < 0 || index >= m_bufCount) {
          qCWarning(KWIN_ANLAND) << "cannot begin frame with buffer count" << m_bufCount
 -                               << "and selected index" << m_currentIndex;
@@ -211,7 +211,7 @@ index 9ecab43..250922e 100644
 -    m_damageFlags &= ~(uint8_t)(1 << m_currentIndex);
 -    if (m_damageFlags != 0)
 -        addRepaint(infiniteRegion());
-+    const int index = m_backend->selectedBuffer();
++    const int index = m_backend->backend()->selectedBuffer();
 +    m_accumDamage[index] = QRegion();
 
      // Instead of CPU-blocking on glFinish, create a fence for the just-submitted
