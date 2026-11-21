@@ -1,0 +1,109 @@
+Description: Apply each Anland pointer position once
+
+diff --git a/src/backends/anland/anland_backend.cpp b/src/backends/anland/anland_backend.cpp
+index 153f47d..6e15e9b 100644
+--- a/src/backends/anland/anland_backend.cpp
++++ b/src/backends/anland/anland_backend.cpp
+@@ -301,12 +301,10 @@ void AnlandBackend::processInputEvent(const InputEvent &ev)
+
+     switch (ev.type) {
+     case INPUT_TYPE_POINTER_MOTION: {
+-        // Both absolute position (x, y) and relative delta (dx, dy) come from the
+-        // consumer. Use the same mapInputToLogical for both so that dx/dy delivered
+-        // via wl_pointer.relative_motion match the cursor's position space, giving
+-        // Wayland clients correct velocity for momentum/kinetic scrolling.
+         const QPointF pos = mapInputToLogical(QPointF(ev.pointer_motion.x, ev.pointer_motion.y));
+-        const QPointF delta = mapInputToLogical(QPointF(ev.pointer_motion.dx, ev.pointer_motion.dy));
++        // Subtract the transformed origin to retain only the vector transform.
++        const QPointF delta = mapInputToLogical(QPointF(ev.pointer_motion.dx, ev.pointer_motion.dy))
++            - mapInputToLogical(QPointF());
+         m_inputDevice->pointerMotion(pos, delta, delta);
+         break;
+     }
+diff --git a/src/backends/anland/anland_input.cpp b/src/backends/anland/anland_input.cpp
+index b2bb835..53e1e57 100644
+--- a/src/backends/anland/anland_input.cpp
++++ b/src/backends/anland/anland_input.cpp
+@@ -92,16 +92,9 @@ bool AnlandInputDevice::isLidSwitch() const
+ // backend does). Without it scroll is dropped entirely; cursor motion and focus
+ // still appear to work only because PointerInputRedirection handles those
+ // compositor-side, independent of client delivery.
+-void AnlandInputDevice::pointerMotionAbsolute(const QPointF &position)
+-{
+-    Q_EMIT InputDevice::pointerMotionAbsolute(position, now(), this);
+-    Q_EMIT InputDevice::pointerFrame(this);
+-}
+-
+ void AnlandInputDevice::pointerMotion(const QPointF &pos, const QPointF &delta, const QPointF &deltaUnaccel)
+ {
+-    Q_EMIT InputDevice::pointerMotionAbsolute(pos, now(), this);
+-    Q_EMIT InputDevice::pointerMotion(delta, deltaUnaccel, now(), this);
++    Q_EMIT InputDevice::pointerMotionWithPosition(pos, delta, deltaUnaccel, now(), this);
+     Q_EMIT InputDevice::pointerFrame(this);
+ }
+
+diff --git a/src/backends/anland/anland_input.h b/src/backends/anland/anland_input.h
+index 787f146..a776ba4 100644
+--- a/src/backends/anland/anland_input.h
++++ b/src/backends/anland/anland_input.h
+@@ -41,7 +41,6 @@ public:
+     bool isLidSwitch() const override;
+
+     // Event injection helpers (called by AnlandBackend from the data-fd reader).
+-    void pointerMotionAbsolute(const QPointF &position);
+     void pointerMotion(const QPointF &pos, const QPointF &delta, const QPointF &deltaUnaccel);
+     void pointerButton(quint32 button, bool pressed);
+     void pointerAxis(PointerAxis axis, qreal delta, qint32 deltaV120);
+diff --git a/src/core/inputdevice.h b/src/core/inputdevice.h
+index f976cfd..3d5006f 100644
+--- a/src/core/inputdevice.h
++++ b/src/core/inputdevice.h
+@@ -125,6 +125,7 @@ Q_SIGNALS:
+     void pointerButtonChanged(quint32 button, PointerButtonState state, std::chrono::microseconds time, InputDevice *device);
+     void pointerMotionAbsolute(const QPointF &position, std::chrono::microseconds time, InputDevice *device);
+     void pointerMotion(const QPointF &delta, const QPointF &deltaNonAccelerated, std::chrono::microseconds time, InputDevice *device);
++    void pointerMotionWithPosition(const QPointF &position, const QPointF &delta, const QPointF &deltaNonAccelerated, std::chrono::microseconds time, InputDevice *device);
+     void pointerAxisChanged(PointerAxis axis, qreal delta, qint32 deltaV120, PointerAxisSource source, bool inverted, std::chrono::microseconds time, InputDevice *device);
+     void pointerFrame(InputDevice *device);
+     void touchFrame(InputDevice *device);
+diff --git a/src/input.cpp b/src/input.cpp
+index c0faee3..34d171e 100644
+--- a/src/input.cpp
++++ b/src/input.cpp
+@@ -3149,6 +3149,8 @@ void InputRedirection::addInputDevice(InputDevice *device)
+             m_pointer, &PointerInputRedirection::processMotionAbsolute);
+     connect(device, &InputDevice::pointerMotion,
+             m_pointer, &PointerInputRedirection::processMotion);
++    connect(device, &InputDevice::pointerMotionWithPosition,
++            m_pointer, &PointerInputRedirection::processMotionWithPosition);
+     connect(device, &InputDevice::pointerButtonChanged,
+             m_pointer, &PointerInputRedirection::processButton);
+     connect(device, &InputDevice::pointerAxisChanged,
+diff --git a/src/pointer_input.cpp b/src/pointer_input.cpp
+index c6ae0bf..1ea5e98 100644
+--- a/src/pointer_input.cpp
++++ b/src/pointer_input.cpp
+@@ -240,6 +240,11 @@ void PointerInputRedirection::processMotion(const QPointF &delta, const QPointF
+     processMotionInternal(m_pos + delta, delta, deltaNonAccelerated, time, device, MotionType::Motion);
+ }
+
++void PointerInputRedirection::processMotionWithPosition(const QPointF &position, const QPointF &delta, const QPointF &deltaNonAccelerated, std::chrono::microseconds time, InputDevice *device)
++{
++    processMotionInternal(position, delta, deltaNonAccelerated, time, device, MotionType::Motion);
++}
++
+ void PointerInputRedirection::processMotionInternal(const QPointF &pos, const QPointF &delta, const QPointF &deltaNonAccelerated, std::chrono::microseconds time, InputDevice *device, MotionType type)
+ {
+     input()->setLastInputHandler(this);
+diff --git a/src/pointer_input.h b/src/pointer_input.h
+index 7ba6631..fd3e294 100644
+--- a/src/pointer_input.h
++++ b/src/pointer_input.h
+@@ -88,6 +88,7 @@ public:
+      * @internal
+      */
+     void processMotion(const QPointF &delta, const QPointF &deltaNonAccelerated, std::chrono::microseconds time, InputDevice *device);
++    void processMotionWithPosition(const QPointF &position, const QPointF &delta, const QPointF &deltaNonAccelerated, std::chrono::microseconds time, InputDevice *device);
+     /**
+      * @internal
+      */
