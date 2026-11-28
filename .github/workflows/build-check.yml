@@ -1,6 +1,7 @@
 name: Build Check
 
 on:
+  workflow_dispatch:
   pull_request:
     branches:
       - debian/trixie
@@ -71,11 +72,14 @@ jobs:
           : > /github/home/ccache-wrapper.log
 
       - name: Clone repository
+        env:
+          SOURCE_REF: ${{ github.head_ref || github.ref_name }}
+          SOURCE_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
         run: |
           cd ~
           git config --global user.email "actions@github.com"
           git config --global user.name "GitHub Actions"
-          git clone -b ${{ github.event.pull_request.head.ref }} --depth 1 ${{ github.event.pull_request.head.repo.html_url }}.git kwin
+          git clone -b "$SOURCE_REF" --depth 1 "https://github.com/$SOURCE_REPO.git" kwin
           cd kwin
           git switch -c ci-build
 

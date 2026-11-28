@@ -1,0 +1,151 @@
+Description: Support captured mouse deltas without overriding cursor position
+
+diff --git a/src/backends/anland/anland_backend.cpp b/src/backends/anland/anland_backend.cpp
+index 33f457e..82d0d17 100644
+--- a/src/backends/anland/anland_backend.cpp
++++ b/src/backends/anland/anland_backend.cpp
+@@ -300,12 +300,17 @@ void AnlandBackend::processInputEvent(const InputEvent &ev)
+     }
+
+     switch (ev.type) {
+-    case INPUT_TYPE_POINTER_MOTION: {
+-        const QPointF pos = mapInputToLogical(QPointF(ev.pointer_motion.x, ev.pointer_motion.y));
++    case INPUT_TYPE_POINTER_MOTION:
++    case INPUT_TYPE_POINTER_MOTION_RELATIVE: {
+         // Subtract the transformed origin to retain only the vector transform.
+         const QPointF delta = mapInputToLogical(QPointF(ev.pointer_motion.dx, ev.pointer_motion.dy))
+             - mapInputToLogical(QPointF());
+-        m_inputDevice->pointerMotion(pos, delta, delta);
++        if (ev.type == INPUT_TYPE_POINTER_MOTION_RELATIVE) {
++            m_inputDevice->pointerMotionRelative(delta);
++        } else {
++            const QPointF pos = mapInputToLogical(QPointF(ev.pointer_motion.x, ev.pointer_motion.y));
++            m_inputDevice->pointerMotion(pos, delta, delta);
++        }
+         break;
+     }
+     case INPUT_TYPE_POINTER_BUTTON:
+@@ -431,6 +436,7 @@ void AnlandBackend::enterFallback()
+     qCWarning(KWIN_ANLAND) << "consumer disconnected, entering fallback";
+
+     if (m_inputDevice) {
++        m_inputDevice->releaseKeys();
+         m_inputDevice->touchCancel();
+     }
+
+@@ -495,6 +501,12 @@ void AnlandBackend::onReconnectTimer()
+     // event whose fds onInputReadable() hands to the camera engine. If the consumer
+     // has the camera disabled it simply never registers the service and never replies,
+     // so this is a harmless no-op in that case.
++    const OutputEvent capabilities = {
++        .type = OUTPUT_TYPE_RELATIVE_POINTER_SUPPORTED,
++    };
++    if (push_output_event(m_display, &capabilities) < 0) {
++        return;
++    }
+     const int cameraRequestResult = push_resources_request(m_display, SERVICE_TYPE_CAMERA, nullptr);
+     qCDebug(KWIN_ANLAND) << "reconnect: camera request result" << cameraRequestResult;
+ }
+diff --git a/src/backends/anland/anland_input.cpp b/src/backends/anland/anland_input.cpp
+index 53e1e57..0cbac4a 100644
+--- a/src/backends/anland/anland_input.cpp
++++ b/src/backends/anland/anland_input.cpp
+@@ -8,6 +8,7 @@
+ #include "anland_backend.h"
+
+ #include <chrono>
++#include <utility>
+
+ namespace KWin
+ {
+@@ -98,6 +99,12 @@ void AnlandInputDevice::pointerMotion(const QPointF &pos, const QPointF &delta,
+     Q_EMIT InputDevice::pointerFrame(this);
+ }
+
++void AnlandInputDevice::pointerMotionRelative(const QPointF &delta)
++{
++    Q_EMIT InputDevice::pointerMotion(delta, delta, now(), this);
++    Q_EMIT InputDevice::pointerFrame(this);
++}
++
+ void AnlandInputDevice::pointerButton(quint32 button, bool pressed)
+ {
+     Q_EMIT pointerButtonChanged(button,
+@@ -118,11 +125,23 @@ void AnlandInputDevice::pointerAxis(PointerAxis axis, qreal delta, qint32 deltaV
+
+ void AnlandInputDevice::keyboardKey(quint32 keycode, bool pressed)
+ {
++    if (pressed) {
++        m_pressedKeys.insert(keycode);
++    } else {
++        m_pressedKeys.remove(keycode);
++    }
+     Q_EMIT keyChanged(keycode,
+                       pressed ? KeyboardKeyState::Pressed : KeyboardKeyState::Released,
+                       now(), this);
+ }
+
++void AnlandInputDevice::releaseKeys()
++{
++    for (const quint32 keycode : std::exchange(m_pressedKeys, {})) {
++        keyboardKey(keycode, false);
++    }
++}
++
+ void AnlandInputDevice::touchDown(qint32 id, const QPointF &position)
+ {
+     Q_EMIT InputDevice::touchDown(id, position, now(), this);
+diff --git a/src/backends/anland/anland_input.h b/src/backends/anland/anland_input.h
+index a776ba4..f7ffa79 100644
+--- a/src/backends/anland/anland_input.h
++++ b/src/backends/anland/anland_input.h
+@@ -13,6 +13,8 @@
+ #include "core/inputbackend.h"
+ #include "core/inputdevice.h"
+
++#include <QSet>
++
+ namespace KWin
+ {
+
+@@ -42,9 +44,11 @@ public:
+
+     // Event injection helpers (called by AnlandBackend from the data-fd reader).
+     void pointerMotion(const QPointF &pos, const QPointF &delta, const QPointF &deltaUnaccel);
++    void pointerMotionRelative(const QPointF &delta);
+     void pointerButton(quint32 button, bool pressed);
+     void pointerAxis(PointerAxis axis, qreal delta, qint32 deltaV120);
+     void keyboardKey(quint32 keycode, bool pressed);
++    void releaseKeys();
+     void touchDown(qint32 id, const QPointF &position);
+     void touchMotion(qint32 id, const QPointF &position);
+     void touchUp(qint32 id);
+@@ -53,6 +57,7 @@ public:
+
+ private:
+     bool m_enabled = true;
++    QSet<quint32> m_pressedKeys;
+ };
+
+ class AnlandInputBackend : public InputBackend
+diff --git a/src/backends/anland/protocol.h b/src/backends/anland/protocol.h
+index c76b506..52f7c69 100644
+--- a/src/backends/anland/protocol.h
++++ b/src/backends/anland/protocol.h
+@@ -66,6 +66,8 @@ struct buf_info {
+  * The InputEvent carries { service type, fdnum }; the fdnum fds follow as a
+  * separate DATA_MSG_INPUT_EXTEND_FDS message (SCM_RIGHTS). */
+ #define INPUT_TYPE_RESOURCE       11
++/* Only pointer_motion.dx and .dy carry data for this event. */
++#define INPUT_TYPE_POINTER_MOTION_RELATIVE 12
+
+ /* Service identifiers used by OUTPUT_TYPE_RESOURCES_REQUEST / INPUT_TYPE_RESOURCE. */
+ #define SERVICE_TYPE_CAMERA 1
+@@ -145,6 +147,7 @@ struct OutputEvent{
+
+ #define OUTPUT_TYPE_CLIPBOARD 1
+ #define OUTPUT_TYPE_RESOURCES_REQUEST 2
++#define OUTPUT_TYPE_RELATIVE_POINTER_SUPPORTED 3
+
+ /*
+  * Audio runs on its own dedicated bidirectional socketpair (hello fd slot 4),

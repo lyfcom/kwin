@@ -33,3 +33,7 @@ plugins-qpa-fall-back-to-software-without-a-DRM-device.patch
 backends-anland-handle-audio-socket-read-errors.patch
 backends-anland-fix-audio-socket-lifetime-during-fallback.patch
 wayland-optimize-dma-buf-synchronization-for-Anland.patch
+backends-anland-apply-pointer-position-once.patch
+backends-anland-separate-buffer-repair-from-scene-damage.patch
+backends-anland-support-relative-mouse-motion.patch
+backends-anland-support-prerotated-display-buffers.patch
