@@ -1,3 +1,9 @@
+kwin (4:6.3.6-96+lyfcom3~asap1) unstable; urgency=medium
+
+  * Add opt-in immediate compositing for Anland latency experiments.
+
+ -- lyfcom <lyfcom@users.noreply.github.com>  Sat, 28 Nov 2026 20:30:00 +0800
+
 kwin (4:6.3.6-96+lyfcom2) unstable; urgency=medium
 
   * Support relative motion from captured Anland mice.
