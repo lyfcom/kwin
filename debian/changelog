@@ -1,3 +1,9 @@
+kwin (4:6.3.6-96+lyfcom3~prerotation1) unstable; urgency=medium
+
+  * Support pre-rotated Android DMA-BUF render targets.
+
+ -- lyfcom <lyfcom@users.noreply.github.com>  Sat, 28 Nov 2026 20:55:23 +0800
+
 kwin (4:6.3.6-96+lyfcom2) unstable; urgency=medium
 
   * Support relative motion from captured Anland mice.

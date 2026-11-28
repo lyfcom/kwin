@@ -1,0 +1,158 @@
+Description: Render Anland output into buffers in the Android panel orientation
+ Negotiate support when receiving consumer buffer descriptors. Apply the storage
+ transform in the render target while keeping the desktop and input geometry.
+Forwarded: not-needed
+
+--- a/src/backends/anland/protocol.h
++++ b/src/backends/anland/protocol.h
+@@ -9,6 +9,13 @@
+ #define CTRL_MSG_REJECT          8
+ #define CTRL_MSG_PICKUP_FDS      9
+ #define CTRL_MSG_FDS_READY      10
++#define CTRL_MSG_CONSUMER_PREROTATION 11
++#define CTRL_MSG_FDS_READY_PREROTATION 12
++
++#define DISPLAY_CAP_PREROTATION 1u
++/* Upper bits describe clockwise storage rotation in quarter-turns. */
++#define BUF_FORMAT_MASK 0xffu
++#define BUF_ROTATION_SHIFT 8
+ 
+ #define DATA_MSG_BUF_READY       100
+ #define DATA_MSG_REFRESH_DONE    101
+@@ -40,8 +47,8 @@
+ 
+ struct buf_info {
+     uint32_t stride;
+-    uint32_t width;      /* buffer logical width  (consumer-side native resolution) */
+-    uint32_t height;     /* buffer logical height (consumer-side native resolution) */
++    uint32_t width;      /* buffer storage width */
++    uint32_t height;     /* buffer storage height */
+     uint32_t format;
+     uint64_t modifier;
+     uint32_t offset;
+--- a/src/backends/anland/display_producer.c
++++ b/src/backends/anland/display_producer.c
+@@ -86,8 +86,8 @@
+  */
+ static int pickup_fds(display_ctx *ctx)
+ {
+-    struct ctrl_msg hdr = { .type = CTRL_MSG_PICKUP_FDS, .size = 0 };
+-    if (send_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) < 0)
++    const uint32_t request[] = { CTRL_MSG_PICKUP_FDS, sizeof(uint32_t), DISPLAY_CAP_PREROTATION };
++    if (send_all(ctx->ctrl_fd, &request, sizeof(request)) < 0)
+         return -1;
+ 
+     struct pollfd pfd = { .fd = ctx->ctrl_fd, .events = POLLIN };
+--- a/src/backends/anland/anland_egl_backend.h
++++ b/src/backends/anland/anland_egl_backend.h
+@@ -14,6 +14,7 @@
+ */
+ #pragma once
+ 
++#include "core/output.h"
+ #include "core/outputlayer.h"
+ #include "platformsupport/scenes/opengl/abstract_egl_backend.h"
+ 
+@@ -53,11 +54,13 @@
+ 
+ private:
+     void onOutputTransformChanged();
++    OutputTransform bufferContentTransform() const;
+ 
+     AnlandEglBackend *const m_backend;
+     AnlandOutput *m_output;
+     display_ctx *const m_display;
+ 
++    OutputTransform m_bufferRotation;
+     int m_bufCount = 0;
+     bool m_traceNextFrame = false;
+     std::array<std::shared_ptr<GLTexture>, MAX_BUFS> m_textures;
+--- a/src/backends/anland/anland_egl_backend.cpp
++++ b/src/backends/anland/anland_egl_backend.cpp
+@@ -97,19 +97,6 @@
+ 
+     releaseBuffers();
+ 
+-    // The consumer reads this dmabuf top-down, while GL renders bottom-up, so the
+-    // content transform always carries a vertical flip. On top of that we fold in
+-    // the output's configured rotation, so the scene is rendered pre-rotated into
+-    // the (fixed-size, landscape) dmabuf — that is what lets the very same buffer
+-    // drive a portrait / 180° display. KWin's renderer (RenderTarget/RenderViewport)
+-    // bakes this single transform into the root projection with no extra copy; it is
+-    // the official 6.x replacement for the old GLFramebuffer::setYInverted() flag the
+-    // 5.27 patch carried. Combining the output rotation with FlipY mirrors the DRM
+-    // backend exactly (drmOutput()->transform().combine(OutputTransform::FlipY)).
+-    // The tag is sticky on each texture; after import it is only ever updated
+-    // reactively, in onOutputTransformChanged().
+-    const OutputTransform contentTransform = m_output->transform().combine(OutputTransform::FlipY);
+-
+     for (int i = 0; i < count; i++) {
+         const int fd = get_dmabuf_fd_at(m_display, i);
+         buf_info info;
+@@ -119,16 +106,23 @@
+             return false;
+         }
+ 
+-        /* The per-buffer width/height come from the consumer's native resolution
+-         * (buf_info, filled by collect_dmabufs). If it differs from the current
+-         * OutputMode, resize the output to match — the consumer may have rotated or
+-         * switched display modes. All buffers in a set share the same size, so we
+-         * only need to check the first buffer. */
++        const auto quarterTurns = info.format >> BUF_ROTATION_SHIFT;
++        if (quarterTurns > 3 || (i > 0 && quarterTurns != uint32_t(m_bufferRotation.inverted().kind()))) {
++            qCWarning(KWIN_ANLAND) << "inconsistent Anland buffer rotation" << quarterTurns;
++            releaseBuffers();
++            return false;
++        }
+         if (i == 0) {
+-            const QSize bufSize(info.width, info.height);
+-            if (bufSize != m_output->modeSize() && bufSize.isValid()) {
+-                qCInfo(KWIN_ANLAND) << "dmabuf size changed, resizing output to" << bufSize;
+-                m_output->resize(bufSize);
++            // OutputTransform angles are counterclockwise.
++            m_bufferRotation = OutputTransform(OutputTransform::Kind((4 - quarterTurns) % 4));
++        }
++
++        /* Buffer storage can be pre-rotated for Android composition. Canceled at presentation,
++         * this rotation is independent of the desktop mode and input geometry. */
++        if (i == 0) {
++            const QSize logicalBufferSize = m_bufferRotation.map(QSize(info.width, info.height));
++            if (logicalBufferSize.isValid() && logicalBufferSize != m_output->modeSize()) {
++                m_output->resize(logicalBufferSize);
+             }
+         }
+         const QSize actual(info.width, info.height);
+@@ -137,7 +131,7 @@
+         attrs.planeCount = 1;
+         attrs.width = actual.width();
+         attrs.height = actual.height();
+-        attrs.format = protocol_format_to_drm(info.format);
++        attrs.format = protocol_format_to_drm(info.format & BUF_FORMAT_MASK);
+         attrs.modifier = info.modifier;
+         // The producer owns the dmabuf fd; DmaBufAttributes (and the EGLImage we
+         // hand the fd to) must not close it, so dup() into the owning slot.
+@@ -155,7 +149,7 @@
+             return false;
+         }
+ 
+-        texture->setContentTransform(contentTransform);
++        texture->setContentTransform(bufferContentTransform());
+         auto fbo = std::make_unique<GLFramebuffer>(texture.get());
+         if (!fbo->valid()) {
+             qCWarning(KWIN_ANLAND) << "framebuffer for dmabuf" << i << "is not complete";
+@@ -178,9 +172,14 @@
+     return true;
+ }
+ 
++OutputTransform AnlandEglLayer::bufferContentTransform() const
++{
++    return m_output->transform().combine(m_bufferRotation).combine(OutputTransform::FlipY);
++}
++
+ void AnlandEglLayer::onOutputTransformChanged()
+ {
+-    const OutputTransform contentTransform = m_output->transform().combine(OutputTransform::FlipY);
++    const OutputTransform contentTransform = bufferContentTransform();
+     for (int i = 0; i < m_bufCount; i++) {
+         m_textures[i]->setContentTransform(contentTransform);
+         // The cached RenderTarget captured the old transform; rebuild it so the
