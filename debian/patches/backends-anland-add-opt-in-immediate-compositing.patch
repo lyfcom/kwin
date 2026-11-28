@@ -1,0 +1,47 @@
+Description: Allow Anland to start compositing as soon as a buffer can be rendered
+ Keep Android in charge of presentation and retain KWin frame accounting.
+ Opt in with ANLAND_RENDER_ASAP=1 for on-device comparisons.
+Forwarded: not-needed
+
+--- a/src/backends/anland/anland_output.cpp
++++ b/src/backends/anland/anland_output.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "core/renderbackend.h" // OutputFrame
+ #include "core/renderloop.h"
++#include "core/renderloop_p.h"
+ 
+ #include <chrono>
+ 
+@@ -21,6 +22,9 @@
+     , m_backend(parent)
+     , m_renderLoop(std::make_unique<RenderLoop>(this))
+ {
++    // Android paces presentation and grants the next writable buffer.
++    RenderLoopPrivate::get(m_renderLoop.get())->scheduleCompositingImmediately =
++        qEnvironmentVariableIntValue("ANLAND_RENDER_ASAP") > 0;
+     setInformation(Information{
+         .name = name,
+         .manufacturer = QStringLiteral("anland"),
+--- a/src/core/renderloop_p.h
++++ b/src/core/renderloop_p.h
+@@ -51,6 +51,7 @@
+     int inhibitCount = 0;
+     bool pendingReschedule = false;
+     bool pendingRepaint = false;
++    bool scheduleCompositingImmediately = false;
+     std::chrono::nanoseconds safetyMargin{0};
+ 
+     PresentationMode presentationMode = PresentationMode::VSync;
+--- a/src/core/renderloop.cpp
++++ b/src/core/renderloop.cpp
+@@ -122,7 +122,8 @@
+     }
+ 
+     const std::chrono::nanoseconds nextRenderTimestamp = nextPresentationTimestamp - expectedCompositingTime;
+-    compositeTimer.start(std::max(0ms, std::chrono::duration_cast<std::chrono::milliseconds>(nextRenderTimestamp - currentTime)));
++    const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(nextRenderTimestamp - currentTime);
++    compositeTimer.start(scheduleCompositingImmediately ? 0ms : std::max(0ms, delay));
+ }
+ 
+ void RenderLoopPrivate::delayScheduleRepaint()

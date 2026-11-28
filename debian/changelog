@@ -1,3 +1,23 @@
+kwin (4:6.3.6-96+lyfcom3~asap1) unstable; urgency=medium
+
+  * Add opt-in immediate compositing for Anland latency experiments.
+
+ -- lyfcom <lyfcom@users.noreply.github.com>  Sat, 28 Nov 2026 20:30:00 +0800
+
+kwin (4:6.3.6-96+lyfcom2) unstable; urgency=medium
+
+  * Support relative motion from captured Anland mice.
+  * Release Anland keyboard keys when the consumer disconnects.
+
+ -- lyfcom <lyfcom@users.noreply.github.com>  Sun, 22 Nov 2026 00:10:44 +0800
+
+kwin (4:6.3.6-96+lyfcom1) unstable; urgency=medium
+
+  * Apply each Anland pointer position once and preserve relative motion.
+  * Repair only the DMA-BUF selected by the Anland consumer.
+
+ -- lyfcom <lyfcom@users.noreply.github.com>  Sat, 21 Nov 2026 18:12:37 +0800
+
 kwin (4:6.3.6-96) unstable; urgency=medium
 
   [ superturtlee ]
